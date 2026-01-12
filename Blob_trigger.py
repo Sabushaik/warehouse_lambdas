@@ -17,11 +17,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Database configuration
-PG_HOST = "145.190.8.4"
-PG_PORT = "5432"
-PG_USER = "spectra"
-PG_PASSWORD = "SpectraParabola9"
-PG_DATABASE = "ap_warehouse"
+# TODO: Move to AWS Secrets Manager for production
+PG_HOST = os.environ.get('PG_HOST', '145.190.8.4')
+PG_PORT = os.environ.get('PG_PORT', '5432')
+PG_USER = os.environ.get('PG_USER', 'spectra')
+PG_PASSWORD = os.environ.get('PG_PASSWORD', 'SpectraParabola9')
+PG_DATABASE = os.environ.get('PG_DATABASE', 'ap_warehouse')
 
 def get_db_connection():
     """Create and return a PostgreSQL database connection"""
@@ -373,8 +374,13 @@ def lambda_handler(event, context):
         dict: Response with status code and message
     """
     try:
+        # Extract safe event metadata for logging
+        event_metadata = {
+            "record_count": len(event.get('Records', [])),
+            "event_source": event.get('Records', [{}])[0].get('eventSource', 'unknown') if event.get('Records') else 'unknown'
+        }
         log_structured_message("lambda_trigger_start", None, "started", {
-            "event": event,
+            "event_metadata": event_metadata,
             "function_name": context.function_name if context else "unknown"
         })
         
@@ -383,7 +389,7 @@ def lambda_handler(event, context):
         if 'Records' not in event:
             log_structured_message("invalid_event", None, "error", {
                 "reason": "No Records found in event",
-                "event": event
+                "event_keys": list(event.keys()) if isinstance(event, dict) else "not_a_dict"
             })
             return {
                 'statusCode': 400,
