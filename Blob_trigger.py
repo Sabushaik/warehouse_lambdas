@@ -1,4 +1,3 @@
-import azure.functions as func
 import json
 import requests
 import logging
@@ -8,6 +7,7 @@ from psycopg2.extras import RealDictCursor
 from typing import Dict, Optional, Any, Tuple
 from datetime import datetime
 import re
+from urllib.parse import unquote_plus
 
 # Configure structured logging
 logging.basicConfig(
@@ -16,14 +16,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = func.FunctionApp()
-
 # Database configuration
-PG_HOST = "145.190.8.4"
-PG_PORT = "5432"
-PG_USER = "spectra"
-PG_PASSWORD = "SpectraParabola9"
-PG_DATABASE = "ap_warehouse"
+# TODO: Move to AWS Secrets Manager for production
+PG_HOST = os.environ.get('PG_HOST', '145.190.8.4')
+PG_PORT = os.environ.get('PG_PORT', '5432')
+PG_USER = os.environ.get('PG_USER', 'spectra')
+PG_PASSWORD = os.environ.get('PG_PASSWORD', 'SpectraParabola9')
+PG_DATABASE = os.environ.get('PG_DATABASE', 'ap_warehouse')
 
 def get_db_connection():
     """Create and return a PostgreSQL database connection"""
@@ -47,8 +46,8 @@ def log_structured_message(event_type: str, camera_id: str = None, status: str =
         "event_type": event_type,
         "camera_id": camera_id or "unknown",
         "status": status,
-        "service": "azure-pipeline-processor",
-        "environment": "azure-function",
+        "service": "aws-pipeline-processor",
+        "environment": "aws-lambda",
         "details": details or {}
     }
     logger.info(json.dumps(log_entry))
@@ -56,13 +55,17 @@ def log_structured_message(event_type: str, camera_id: str = None, status: str =
 def parse_blob_url(blob_url: str) -> Optional[Tuple[str, str, str, str]]:
     """
     Parse blob URL with new structure: pipeline/Date/WH001/CAM006/CHUNK_uuid/CHUNK_uuid.mp4
+    Works with both Azure Blob Storage and AWS S3 URLs
     Returns: (warehouse_id, cam_id, chunk_id, date) or None
     """
     try:
+        # Decode URL-encoded characters (for S3 URLs)
+        decoded_url = unquote_plus(blob_url)
+        
         # Pattern: pipeline/YYYY-MM-DD/WH###/CAM###/CHUNK_uuid/CHUNK_uuid.mp4
         # Updated to handle uppercase letters in UUID (e.g., 0426047D)
         pattern = r'/pipeline/(\d{4}-\d{2}-\d{2})/([A-Z0-9]+)/([A-Z0-9]+)/CHUNK_([a-fA-F0-9\-]+)/CHUNK_[a-fA-F0-9\-]+\.mp4'
-        match = re.search(pattern, blob_url)
+        match = re.search(pattern, decoded_url)
         
         if match:
             date = match.group(1)
@@ -80,7 +83,7 @@ def parse_blob_url(blob_url: str) -> Optional[Tuple[str, str, str, str]]:
             return warehouse_id, cam_id, chunk_id, date
         else:
             # Fallback: Try splitting by '/' to debug
-            parts = blob_url.split('/')
+            parts = decoded_url.split('/')
             logger.error(f"Regex failed. URL parts: {parts}")
             log_structured_message("blob_url_parse_failed", None, "error", {
                 "blob_url": blob_url,
@@ -358,173 +361,202 @@ def call_fastapi_service(payload: Dict) -> Dict[str, Any]:
             "message": f"Unexpected error: {str(e)}"
         }
 
-@app.event_grid_trigger(arg_name="azeventgrid")
-def PipelineBlobProcessor(azeventgrid: func.EventGridEvent):
+def lambda_handler(event, context):
     """
-    Process Event Grid events for blob storage uploads in pipeline folder
-    Flow: Parse URL → Insert wh_chunks → Fetch camera config → Call FastAPI
+    AWS Lambda handler for S3 bucket events
+    Flow: Parse S3 event → Parse URL → Insert wh_chunks → Fetch camera config → Call FastAPI
+    
+    Args:
+        event: S3 event notification
+        context: Lambda context object
+    
+    Returns:
+        dict: Response with status code and message
     """
     try:
-        log_structured_message("event_grid_trigger_start", None, "started", {
-            "event_type": azeventgrid.event_type,
-            "subject": azeventgrid.subject
+        # Extract safe event metadata for logging
+        event_metadata = {
+            "record_count": len(event.get('Records', [])),
+            "event_source": event.get('Records', [{}])[0].get('eventSource', 'unknown') if event.get('Records') else 'unknown'
+        }
+        log_structured_message("lambda_trigger_start", None, "started", {
+            "event_metadata": event_metadata,
+            "function_name": context.function_name if context else "unknown"
         })
         
-        # Validate event type
-        if azeventgrid.event_type != "Microsoft.Storage.BlobCreated":
-            log_structured_message("event_type_ignored", None, "info", {
-                "ignored_event_type": azeventgrid.event_type
+        # Parse S3 event
+        # S3 events come in Records array
+        if 'Records' not in event:
+            log_structured_message("invalid_event", None, "error", {
+                "reason": "No Records found in event",
+                "event_keys": list(event.keys()) if isinstance(event, dict) else "not_a_dict"
             })
-            return
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Invalid event format')
+            }
         
-        # Check event timestamp - only process recent events (within last 3 minutes)
-        try:
-            # Try to get event time from multiple possible sources
-            event_time_str = None
+        # Process each record in the event
+        for record in event['Records']:
+            # Validate event source and name
+            event_source = record.get('eventSource', '')
+            event_name = record.get('eventName', '')
             
-            # Try getting from event object attribute first
-            if hasattr(azeventgrid, 'event_time') and azeventgrid.event_time:
-                # Convert datetime to string if needed
-                if isinstance(azeventgrid.event_time, datetime):
-                    event_time_str = azeventgrid.event_time.isoformat()
-                else:
-                    event_time_str = str(azeventgrid.event_time)
+            if event_source != 'aws:s3':
+                log_structured_message("event_source_ignored", None, "info", {
+                    "ignored_event_source": event_source
+                })
+                continue
             
-            if not event_time_str:
-                # Try getting from event data JSON
-                try:
-                    event_data_temp = azeventgrid.get_json()
-                    raw_event_time = event_data_temp.get('eventTime') or event_data_temp.get('data', {}).get('eventTime')
-                    if raw_event_time:
-                        if isinstance(raw_event_time, datetime):
-                            event_time_str = raw_event_time.isoformat()
-                        else:
-                            event_time_str = str(raw_event_time)
-                except:
-                    pass
+            if not event_name.startswith('ObjectCreated:'):
+                log_structured_message("event_type_ignored", None, "info", {
+                    "ignored_event_name": event_name
+                })
+                continue
             
-            if event_time_str:
-                # Parse event time - handle both 'Z' and timezone formats
-                event_time_str_clean = event_time_str.replace('Z', '+00:00')
-                event_time = datetime.fromisoformat(event_time_str_clean)
-                current_time = datetime.now(event_time.tzinfo) if event_time.tzinfo else datetime.utcnow()
-                time_difference = (current_time - event_time).total_seconds()
-                
-                # Allow 3 minutes (180 seconds) for event processing delay
-                MAX_EVENT_AGE_SECONDS = 180
-                
-                if time_difference > MAX_EVENT_AGE_SECONDS:
-                    log_structured_message("event_too_old", None, "info", {
+            # Check event timestamp - only process recent events (within last 3 minutes)
+            try:
+                event_time_str = record.get('eventTime')
+                if event_time_str:
+                    # Parse event time - S3 events use ISO format
+                    event_time_str_clean = event_time_str.replace('Z', '+00:00')
+                    event_time = datetime.fromisoformat(event_time_str_clean)
+                    current_time = datetime.now(event_time.tzinfo) if event_time.tzinfo else datetime.utcnow()
+                    time_difference = (current_time - event_time).total_seconds()
+                    
+                    # Allow 3 minutes (180 seconds) for event processing delay
+                    MAX_EVENT_AGE_SECONDS = 180
+                    
+                    if time_difference > MAX_EVENT_AGE_SECONDS:
+                        log_structured_message("event_too_old", None, "info", {
+                            "event_time": event_time_str,
+                            "time_difference_seconds": time_difference,
+                            "max_allowed_seconds": MAX_EVENT_AGE_SECONDS,
+                            "reason": "Event is too old, skipping to prevent reprocessing old chunks"
+                        })
+                        continue
+                    
+                    log_structured_message("event_timestamp_validated", None, "success", {
                         "event_time": event_time_str,
                         "time_difference_seconds": time_difference,
-                        "max_allowed_seconds": MAX_EVENT_AGE_SECONDS,
-                        "reason": "Event is too old, skipping to prevent reprocessing old chunks"
+                        "status": "Event is recent, proceeding with processing"
                     })
-                    return
-                
-                log_structured_message("event_timestamp_validated", None, "success", {
-                    "event_time": event_time_str,
-                    "time_difference_seconds": time_difference,
-                    "status": "Event is recent, proceeding with processing"
+                else:
+                    log_structured_message("event_time_not_found", None, "warning", {
+                        "reason": "Event time not found, proceeding with processing anyway"
+                    })
+            except Exception as e:
+                log_structured_message("event_timestamp_validation_error", None, "warning", {
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "action": "Proceeding with processing despite timestamp validation failure"
                 })
-            else:
-                log_structured_message("event_time_not_found", None, "warning", {
-                    "reason": "Event time not found, proceeding with processing anyway"
+            
+            # Extract S3 object information
+            s3_info = record.get('s3', {})
+            bucket_name = s3_info.get('bucket', {}).get('name', '')
+            object_key = s3_info.get('object', {}).get('key', '')
+            
+            if not bucket_name or not object_key:
+                log_structured_message("missing_s3_info", None, "error", {
+                    "bucket_name": bucket_name,
+                    "object_key": object_key
                 })
-        except Exception as e:
-            log_structured_message("event_timestamp_validation_error", None, "warning", {
-                "error": str(e),
-                "error_type": type(e).__name__,
-                "action": "Proceeding with processing despite timestamp validation failure"
-            })
-        
-        # Get blob URL from event
-        event_data = azeventgrid.get_json()
-        blob_url = event_data.get('url')
-        
-        if not blob_url:
-            log_structured_message("missing_blob_url", None, "error", {
-                "event_data": event_data
-            })
-            return
-        
-        # Validate blob is in pipeline folder and is .mp4
-        if '/pipeline/' not in blob_url or not blob_url.lower().endswith('.mp4'):
-            log_structured_message("blob_not_valid", None, "info", {
+                continue
+            
+            # Construct blob URL from S3 bucket and key
+            # Format: https://bucket-name.s3.region.amazonaws.com/object-key
+            # or s3://bucket-name/object-key
+            aws_region = record.get('awsRegion', 'us-east-1')
+            blob_url = f"https://{bucket_name}.s3.{aws_region}.amazonaws.com/{object_key}"
+            
+            # Validate blob is in pipeline folder and is .mp4
+            if '/pipeline/' not in object_key or not object_key.lower().endswith('.mp4'):
+                log_structured_message("blob_not_valid", None, "info", {
+                    "object_key": object_key,
+                    "reason": "Not in pipeline folder or not mp4"
+                })
+                continue
+            
+            log_structured_message("processing_blob_start", None, "started", {
                 "blob_url": blob_url,
-                "reason": "Not in pipeline folder or not mp4"
-            })
-            return
-        
-        log_structured_message("processing_blob_start", None, "started", {
-            "blob_url": blob_url
-        })
-        
-        # Step 1: Parse blob URL to extract metadata
-        parsed_data = parse_blob_url(blob_url)
-        if not parsed_data:
-            log_structured_message("blob_parsing_failed", None, "error", {
-                "blob_url": blob_url
-            })
-            return
-        
-        warehouse_id, cam_id, chunk_id, date = parsed_data
-        
-        # Step 1.5: Check if chunk already exists in database
-        if check_chunk_exists(chunk_id):
-            log_structured_message("chunk_already_processed", cam_id, "info", {
-                "chunk_id": chunk_id,
-                "warehouse_id": warehouse_id,
-                "cam_id": cam_id,
-                "blob_url": blob_url,
-                "action": "Skipping processing - chunk already exists in database"
-            })
-            return
-        
-        # Step 2: Insert chunk metadata into database
-        insert_success = insert_chunk_metadata(warehouse_id, cam_id, chunk_id, blob_url, date)
-        if not insert_success:
-            log_structured_message("chunk_insert_skipped", cam_id, "warning", {
-                "chunk_id": chunk_id,
-                "reason": "Insert failed or chunk already existed, skipping processing"
-            })
-            return
-        
-        # Step 3: Fetch camera configuration from database
-        # This is the step that uses both warehouse_id and cam_id
-        camera_config = fetch_camera_config(warehouse_id, cam_id)
-        if not camera_config:
-            log_structured_message("camera_config_missing", cam_id, "error", {
-                "warehouse_id": warehouse_id,
-                "cam_id": cam_id,
-                "action": "Skipping processing"
-            })
-            return
-        
-        # Step 4: Construct payload with camera config
-        payload = construct_payload(blob_url, camera_config, chunk_id)
-        
-        # Step 5: Call FastAPI service
-        result = call_fastapi_service(payload)
-        
-        if result["success"]:
-            log_structured_message("pipeline_processing_complete", cam_id, "success", {
-                "chunk_id": chunk_id,
-                "blob_url": blob_url,
-                "fastapi_response": result["response"]
-            })
-        else:
-            log_structured_message("pipeline_processing_failed", cam_id, "error", {
-                "chunk_id": chunk_id,
-                "blob_url": blob_url,
-                "error": result["message"],
-                "status_code": result["status_code"]
+                "bucket_name": bucket_name,
+                "object_key": object_key
             })
             
+            # Step 1: Parse blob URL to extract metadata
+            parsed_data = parse_blob_url(blob_url)
+            if not parsed_data:
+                log_structured_message("blob_parsing_failed", None, "error", {
+                    "blob_url": blob_url
+                })
+                continue
+            
+            warehouse_id, cam_id, chunk_id, date = parsed_data
+            
+            # Step 1.5: Check if chunk already exists in database
+            if check_chunk_exists(chunk_id):
+                log_structured_message("chunk_already_processed", cam_id, "info", {
+                    "chunk_id": chunk_id,
+                    "warehouse_id": warehouse_id,
+                    "cam_id": cam_id,
+                    "blob_url": blob_url,
+                    "action": "Skipping processing - chunk already exists in database"
+                })
+                continue
+            
+            # Step 2: Insert chunk metadata into database
+            insert_success = insert_chunk_metadata(warehouse_id, cam_id, chunk_id, blob_url, date)
+            if not insert_success:
+                log_structured_message("chunk_insert_skipped", cam_id, "warning", {
+                    "chunk_id": chunk_id,
+                    "reason": "Insert failed or chunk already existed, skipping processing"
+                })
+                continue
+            
+            # Step 3: Fetch camera configuration from database
+            # This is the step that uses both warehouse_id and cam_id
+            camera_config = fetch_camera_config(warehouse_id, cam_id)
+            if not camera_config:
+                log_structured_message("camera_config_missing", cam_id, "error", {
+                    "warehouse_id": warehouse_id,
+                    "cam_id": cam_id,
+                    "action": "Skipping processing"
+                })
+                continue
+            
+            # Step 4: Construct payload with camera config
+            payload = construct_payload(blob_url, camera_config, chunk_id)
+            
+            # Step 5: Call FastAPI service
+            result = call_fastapi_service(payload)
+            
+            if result["success"]:
+                log_structured_message("pipeline_processing_complete", cam_id, "success", {
+                    "chunk_id": chunk_id,
+                    "blob_url": blob_url,
+                    "fastapi_response": result["response"]
+                })
+            else:
+                log_structured_message("pipeline_processing_failed", cam_id, "error", {
+                    "chunk_id": chunk_id,
+                    "blob_url": blob_url,
+                    "error": result["message"],
+                    "status_code": result["status_code"]
+                })
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Processing complete')
+        }
+                
     except Exception as e:
-        log_structured_message("pipeline_processor_exception", None, "error", {
+        log_structured_message("lambda_handler_exception", None, "error", {
             "error": str(e),
             "error_type": type(e).__name__
         })
-        logger.error(f"Critical error in PipelineBlobProcessor: {e}")
-        raise
+        logger.error(f"Critical error in lambda_handler: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error processing event: {str(e)}')
+        }
